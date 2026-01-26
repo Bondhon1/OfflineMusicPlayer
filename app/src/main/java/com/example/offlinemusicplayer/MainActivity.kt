@@ -7,7 +7,12 @@ import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.MediaStore
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -25,10 +30,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Pause
@@ -55,23 +63,30 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.example.offlinemusicplayer.data.MusicRepository
+import com.example.offlinemusicplayer.model.Song
 import com.example.offlinemusicplayer.ui.theme.OfflineMusicPlayerTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.ArrayDeque
+import kotlin.random.Random
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            OfflineMusicPlayerTheme {
+            OfflineMusicPlayerTheme(darkTheme = true, dynamicColor = false) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     MusicScreen()
                 }
@@ -79,20 +94,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-
-private data class Song(
-    val id: Long,
-    val title: String,
-    val artist: String,
-    val durationMs: Long,
-    val contentUri: Uri
-)
-
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 private fun MusicScreen() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
+    val repository = remember { MusicRepository(context.applicationContext) }
     val permissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             arrayOf(Manifest.permission.READ_MEDIA_AUDIO)
@@ -108,6 +115,9 @@ private fun MusicScreen() {
     var isPlaying by remember { mutableStateOf(false) }
     var hasLoadedTrack by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var showNowPlaying by remember { mutableStateOf(false) }
+    var normalCount by remember { mutableStateOf(0) }
+    val recentHistory = remember { ArrayDeque<Long>() }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -127,13 +137,145 @@ private fun MusicScreen() {
         if (hasPermission) {
             isLoading = true
             errorMessage = null
+            val cachedSongs = runCatching { repository.loadCachedSongs() }.getOrDefault(emptyList())
+            if (cachedSongs.isNotEmpty()) {
+                songs = cachedSongs
+            }
             songs = try {
-                loadSongs(context)
+                repository.scanDeviceSongs()
             } catch (e: Exception) {
                 errorMessage = "Could not load songs"
-                emptyList()
+                if (cachedSongs.isNotEmpty()) cachedSongs else emptyList()
             }
             isLoading = false
+        }
+    }
+
+    fun registerRecent(songId: Long) {
+        recentHistory.remove(songId)
+        recentHistory.addLast(songId)
+        while (recentHistory.size > 20) {
+            recentHistory.removeFirst()
+        }
+    }
+
+    fun pickNextIndex(): Int? {
+        if (songs.isEmpty()) return null
+        val recentSet = recentHistory.toSet()
+        val candidates = songs.withIndex().filter { it.value.id !in recentSet }
+        val available = if (candidates.isEmpty()) {
+            recentHistory.clear()
+            songs.withIndex().toList()
+        } else {
+            candidates
+        }
+        if (available.isEmpty()) return null
+
+        val chosen = if (normalCount < 2) {
+            normalCount += 1
+            available.random(Random)
+        } else {
+            normalCount = 0
+            available.maxByOrNull { it.value.playCount } ?: available.random(Random)
+        }
+        registerRecent(chosen.value.id)
+        return chosen.index
+    }
+
+    suspend fun finalizePlayback(isUserSkip: Boolean) {
+        val index = currentIndex ?: return
+        val song = songs.getOrNull(index) ?: return
+        val elapsed = runCatching { mediaPlayer.currentPosition.toLong() }.getOrDefault(0L)
+        val quickSkip = isUserSkip && elapsed < 30_000L
+        val delta = if (quickSkip) -2 else 1
+        val updatedCount = (song.playCount + delta).coerceAtLeast(0)
+        val updatedSong = song.copy(playCount = updatedCount, lastPlayedAt = System.currentTimeMillis())
+        songs = songs.toMutableList().also { it[index] = updatedSong }
+        repository.updatePlayStats(song.id, updatedCount, updatedSong.lastPlayedAt)
+        if (delta > 0) {
+            repository.insertHistory(song.id, System.currentTimeMillis())
+        }
+    }
+
+    suspend fun playSong(index: Int, finalizeBefore: Boolean = true) {
+        val song = songs.getOrNull(index) ?: return
+        try {
+            if (finalizeBefore && hasLoadedTrack) {
+                finalizePlayback(isUserSkip = true)
+            }
+            withContext(Dispatchers.IO) {
+                mediaPlayer.reset()
+                mediaPlayer.setDataSource(context, song.contentUri)
+                mediaPlayer.prepare()
+            }
+            mediaPlayer.start()
+            currentIndex = index
+            isPlaying = true
+            hasLoadedTrack = true
+            showNowPlaying = true
+            registerRecent(song.id)
+            mediaPlayer.setOnCompletionListener {
+                scope.launch {
+                    finalizePlayback(isUserSkip = false)
+                    hasLoadedTrack = false
+                    val nextIndex = pickNextIndex()
+                    if (nextIndex != null) {
+                        playSong(nextIndex, finalizeBefore = false)
+                    } else {
+                        isPlaying = false
+                        hasLoadedTrack = false
+                        currentIndex = null
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            errorMessage = "Playback failed"
+            isPlaying = false
+            hasLoadedTrack = false
+        }
+    }
+
+    fun togglePlayPause() {
+        if (isPlaying && hasLoadedTrack) {
+            mediaPlayer.pause()
+            isPlaying = false
+        } else {
+            val target = currentIndex ?: pickNextIndex() ?: 0
+            if (songs.isNotEmpty()) {
+                try {
+                    if (hasLoadedTrack && currentIndex != null) {
+                        mediaPlayer.start()
+                        isPlaying = true
+                    } else {
+                        scope.launch { playSong(target) }
+                    }
+                } catch (_: IllegalStateException) {
+                    scope.launch { playSong(target) }
+                }
+            }
+        }
+    }
+
+    fun playNext() {
+        if (songs.isEmpty()) return
+        scope.launch {
+            val nextIndex = pickNextIndex() ?: ((currentIndex ?: -1) + 1).mod(songs.size)
+            playSong(nextIndex)
+        }
+    }
+
+    fun playPrevious() {
+        if (songs.isEmpty()) return
+        scope.launch {
+            val previousId = recentHistory.reversed().drop(1).firstOrNull()
+            val targetIndex = previousId?.let { id -> songs.indexOfFirst { it.id == id } }
+            val resolvedIndex = if (targetIndex != null && targetIndex >= 0) {
+                targetIndex
+            } else {
+                val candidate = (currentIndex ?: 0) - 1
+                if (candidate >= 0) candidate else songs.lastIndex
+            }
+            playSong(resolvedIndex)
         }
     }
 
@@ -166,43 +308,6 @@ private fun MusicScreen() {
         }
     }
 
-    fun togglePlayPause() {
-        if (isPlaying && hasLoadedTrack) {
-            mediaPlayer.pause()
-            isPlaying = false
-        } else {
-            val target = currentIndex ?: 0
-            if (songs.isNotEmpty()) {
-                try {
-                    if (hasLoadedTrack && currentIndex != null) {
-                        mediaPlayer.start()
-                        isPlaying = true
-                    } else {
-                        scope.launch { playSong(target) }
-                    }
-                } catch (_: IllegalStateException) {
-                    scope.launch { playSong(target) }
-                }
-            }
-        }
-    }
-
-    fun playNext() {
-        if (songs.isEmpty()) return
-        val nextIndex = ((currentIndex ?: -1) + 1).mod(songs.size)
-        scope.launch { playSong(nextIndex) }
-    }
-
-    fun playPrevious() {
-        if (songs.isEmpty()) return
-        val previousIndex = if ((currentIndex ?: 0) - 1 >= 0) {
-            (currentIndex ?: 0) - 1
-        } else {
-            songs.lastIndex
-        }
-        scope.launch { playSong(previousIndex) }
-    }
-
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
@@ -220,15 +325,17 @@ private fun MusicScreen() {
                     isPlaying = isPlaying,
                     onPrevious = ::playPrevious,
                     onPlayPause = ::togglePlayPause,
-                    onNext = ::playNext
+                    onNext = ::playNext,
+                    onExpand = { showNowPlaying = true }
                 )
             }
         }
     ) { padding ->
         val gradient = Brush.verticalGradient(
             colors = listOf(
-                MaterialTheme.colorScheme.surface,
-                MaterialTheme.colorScheme.surfaceVariant
+                Color(0xFF090D18),
+                Color(0xFF0D1527),
+                Color(0xFF0A1222)
             )
         )
 
@@ -247,7 +354,11 @@ private fun MusicScreen() {
                 else -> SongList(
                     songs = songs,
                     currentIndex = currentIndex,
-                    onSongSelected = { index -> scope.launch { playSong(index) } }
+                    onSongSelected = { index ->
+                        normalCount = 0
+                        showNowPlaying = true
+                        scope.launch { playSong(index) }
+                    }
                 )
             }
 
@@ -259,6 +370,20 @@ private fun MusicScreen() {
                         .padding(16.dp),
                     color = MaterialTheme.colorScheme.error
                 )
+            }
+
+            val currentSong = currentIndex?.let { idx -> songs.getOrNull(idx) }
+            AnimatedVisibility(visible = showNowPlaying && currentSong != null) {
+                currentSong?.let { song ->
+                    NowPlayingOverlay(
+                        song = song,
+                        isPlaying = isPlaying,
+                        onClose = { showNowPlaying = false },
+                        onPlayPause = ::togglePlayPause,
+                        onNext = ::playNext,
+                        onPrevious = ::playPrevious
+                    )
+                }
             }
         }
     }
@@ -325,12 +450,14 @@ private fun PlayerBar(
     isPlaying: Boolean,
     onPrevious: () -> Unit,
     onPlayPause: () -> Unit,
-    onNext: () -> Unit
+    onNext: () -> Unit,
+    onExpand: () -> Unit
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(16.dp),
+            .padding(16.dp)
+            .clickable { onExpand() },
         shape = RoundedCornerShape(18.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
     ) {
@@ -361,6 +488,151 @@ private fun PlayerBar(
             }
             IconButton(onClick = onNext) {
                 Icon(imageVector = Icons.Rounded.KeyboardArrowRight, contentDescription = "Next")
+            }
+        }
+    }
+}
+
+@Composable
+private fun NowPlayingOverlay(
+    song: Song,
+    isPlaying: Boolean,
+    onClose: () -> Unit,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit,
+    onPrevious: () -> Unit
+) {
+    val gradient = Brush.verticalGradient(
+        listOf(
+            Color(0xFF050813),
+            Color(0xFF0C1426),
+            Color(0xFF080F1C)
+        )
+    )
+    val pulse = rememberInfiniteTransition(label = "glow").animateFloat(
+        initialValue = 0.9f,
+        targetValue = 1.1f,
+        animationSpec = infiniteRepeatable(
+            tween(durationMillis = 1400, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse"
+    ).value
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(gradient)
+            .padding(24.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .clickable { onClose() }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(imageVector = Icons.Rounded.KeyboardArrowDown, contentDescription = "Back", tint = Color.White)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(text = "Back to list", color = Color.White, style = MaterialTheme.typography.bodyMedium)
+                }
+                IconButton(onClick = onClose) {
+                    Icon(imageVector = Icons.Rounded.Close, contentDescription = "Close", tint = Color.White)
+                }
+            }
+
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(260.dp)
+                        .clip(RoundedCornerShape(28.dp))
+                        .background(Color(0x2200B8FF))
+                        .padding(18.dp)
+                        .clip(RoundedCornerShape(24.dp))
+                        .background(Brush.radialGradient(listOf(Color(0xFF12223E), Color(0xFF0A1120))))
+                        .padding(12.dp)
+                        .scale(pulse)
+                ) {
+                    val bars = listOf(0, 1, 2, 3, 4)
+                    val barTransition = rememberInfiniteTransition(label = "bars")
+                    val transitions = bars.map { offset ->
+                        barTransition.animateFloat(
+                            initialValue = 0.35f,
+                            targetValue = 1f,
+                            animationSpec = infiniteRepeatable(
+                                tween(durationMillis = 900 + (offset * 120), easing = LinearEasing),
+                                repeatMode = RepeatMode.Reverse
+                            ),
+                            label = "bar-height-$offset"
+                        ).value
+                    }
+                    androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                        val barWidth = size.width / (bars.size * 2f)
+                        bars.forEachIndexed { index, _ ->
+                            val heightFactor = transitions[index]
+                            val barHeight = size.height * 0.6f * heightFactor
+                            val x = (index * barWidth * 2f) + barWidth / 2f
+                            drawRoundRect(
+                                color = Color(0xFF9CC8FF),
+                                topLeft = androidx.compose.ui.geometry.Offset(x, (size.height - barHeight) / 2f),
+                                size = androidx.compose.ui.geometry.Size(barWidth, barHeight),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f)
+                            )
+                        }
+                    }
+                }
+
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = song.title,
+                        color = Color.White,
+                        style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.SemiBold),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = song.artist.ifBlank { "Unknown artist" },
+                        color = Color(0xCCFFFFFF),
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                IconButton(onClick = onPrevious) {
+                    Icon(imageVector = Icons.Rounded.KeyboardArrowLeft, contentDescription = "Previous", tint = Color.White)
+                }
+                IconButton(
+                    onClick = onPlayPause,
+                    modifier = Modifier
+                        .size(80.dp)
+                        .clip(RoundedCornerShape(28.dp))
+                        .background(Color(0xFF1F3B6B))
+                ) {
+                    val icon = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow
+                    Icon(imageVector = icon, contentDescription = if (isPlaying) "Pause" else "Play", tint = Color.White, modifier = Modifier.size(42.dp))
+                }
+                IconButton(onClick = onNext) {
+                    Icon(imageVector = Icons.Rounded.KeyboardArrowRight, contentDescription = "Next", tint = Color.White)
+                }
             }
         }
     }
@@ -403,42 +675,6 @@ private fun EmptyState() {
     }
 }
 
-private suspend fun loadSongs(context: Context): List<Song> = withContext(Dispatchers.IO) {
-    val projection = arrayOf(
-        MediaStore.Audio.Media._ID,
-        MediaStore.Audio.Media.TITLE,
-        MediaStore.Audio.Media.ARTIST,
-        MediaStore.Audio.Media.DURATION
-    )
-
-    val selection = MediaStore.Audio.Media.IS_MUSIC + "!= 0"
-    val sortOrder = MediaStore.Audio.Media.TITLE + " ASC"
-    val songs = mutableListOf<Song>()
-
-    context.contentResolver.query(
-        MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-        projection,
-        selection,
-        null,
-        sortOrder
-    )?.use { cursor ->
-        val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
-        val titleColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
-        val artistColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
-        val durationColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
-
-        while (cursor.moveToNext()) {
-            val id = cursor.getLong(idColumn)
-            val title = cursor.getString(titleColumn)
-            val artist = cursor.getString(artistColumn)
-            val duration = cursor.getLong(durationColumn)
-            val contentUri = Uri.withAppendedPath(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id.toString())
-            songs.add(Song(id, title.orEmpty(), artist.orEmpty(), duration, contentUri))
-        }
-    }
-    songs
-}
-
 private fun hasAudioPermission(context: Context, permissions: Array<String>): Boolean =
     permissions.all { perm ->
         ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
@@ -454,13 +690,14 @@ private fun formatDuration(durationMs: Long): String {
 @Preview(showBackground = true)
 @Composable
 private fun MusicScreenPreview() {
-    OfflineMusicPlayerTheme {
+    OfflineMusicPlayerTheme(darkTheme = true, dynamicColor = false) {
         PlayerBar(
             song = Song(1, "Sample Song", "Sample Artist", 210000, Uri.EMPTY),
             isPlaying = true,
             onPrevious = {},
             onPlayPause = {},
-            onNext = {}
+            onNext = {},
+            onExpand = {}
         )
     }
 }
