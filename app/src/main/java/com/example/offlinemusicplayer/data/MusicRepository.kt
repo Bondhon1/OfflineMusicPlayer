@@ -56,7 +56,7 @@ interface MusicDao {
     suspend fun upsertSong(song: SongEntity)
 
     @Query("UPDATE songs SET playCount = :playCount, lastPlayedAt = :lastPlayedAt WHERE id = :id")
-    suspend fun updatePlayStats(id: Long, playCount: Int, lastPlayedAt: Long)
+    suspend fun updatePlayStats(id: Long, playCount: Int, lastPlayedAt: Long): Int
 
     @Insert
     suspend fun insertHistory(entry: PlaybackHistoryEntity)
