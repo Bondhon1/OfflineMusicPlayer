@@ -84,7 +84,7 @@ abstract class MusicDatabase : RoomDatabase() {
     }
 }
 
-class MusicRepository(context: Context) {
+class MusicRepository(private val context: Context) {
     private val musicDao: MusicDao = MusicDatabase.getInstance(context).musicDao()
 
     suspend fun scanDeviceSongs(): List<Song> = withContext(Dispatchers.IO) {
