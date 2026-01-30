@@ -1,12 +1,16 @@
 package com.example.offlinemusicplayer
 
 import android.Manifest
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -36,10 +40,12 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.rounded.List
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.Button
@@ -51,13 +57,17 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -68,6 +78,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -77,10 +88,34 @@ import com.example.offlinemusicplayer.data.MusicRepository
 import com.example.offlinemusicplayer.model.Song
 import com.example.offlinemusicplayer.ui.theme.OfflineMusicPlayerTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.ArrayDeque
 import kotlin.random.Random
+
+@Composable
+fun OMPLogo(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .size(38.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(
+                Brush.linearGradient(
+                    colors = listOf(Color(0xFF4285F4), Color(0xFF34A853))
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "OMP",
+            color = Color.White,
+            style = MaterialTheme.typography.labelLarge.copy(
+                fontWeight = FontWeight.ExtraBold
+            )
+        )
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -103,7 +138,7 @@ private fun MusicScreen() {
     val repository = remember { MusicRepository(context.applicationContext) }
     val permissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(Manifest.permission.READ_MEDIA_AUDIO)
+            arrayOf(Manifest.permission.READ_MEDIA_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
         } else {
             arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
@@ -118,21 +153,46 @@ private fun MusicScreen() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showNowPlaying by remember { mutableStateOf(false) }
     var normalCount by remember { mutableStateOf(0) }
-    val recentHistory = remember { ArrayDeque<Long>() }
+    
+    var currentPosition by remember { mutableStateOf(0f) }
+    var duration by remember { mutableStateOf(0f) }
+    val playbackStack = remember { mutableStateListOf<Int>() }
+
+    var musicService by remember { mutableStateOf<MusicService?>(null) }
+    val connection = remember {
+        object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                musicService = (service as MusicService.MusicBinder).getService()
+            }
+            override fun onServiceDisconnected(name: ComponentName?) { musicService = null }
+        }
+    }
+    DisposableEffect(Unit) {
+        val intent = Intent(context, MusicService::class.java)
+        context.startService(intent)
+        context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        onDispose { context.unbindService(connection) }
+    }
+    val mediaPlayer = musicService?.mediaPlayer
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
         hasPermission = result.values.all { it }
     }
-
-    val mediaPlayer = remember { MediaPlayer() }
-    DisposableEffect(mediaPlayer) {
-        onDispose {
-            mediaPlayer.reset()
-            mediaPlayer.release()
+    
+    LaunchedEffect(isPlaying, hasLoadedTrack, mediaPlayer) {
+        if (isPlaying && hasLoadedTrack && mediaPlayer != null) {
+            while (true) {
+                try {
+                    currentPosition = mediaPlayer.currentPosition.toFloat()
+                    duration = mediaPlayer.duration.toFloat()
+                } catch (_: Exception) {}
+                delay(500)
+            }
         }
     }
+    // Service handles mediaPlayer lifecycle
 
     LaunchedEffect(hasPermission) {
         if (hasPermission) {
@@ -152,24 +212,9 @@ private fun MusicScreen() {
         }
     }
 
-    fun registerRecent(songId: Long) {
-        recentHistory.remove(songId)
-        recentHistory.addLast(songId)
-        while (recentHistory.size > 20) {
-            recentHistory.removeFirst()
-        }
-    }
-
     fun pickNextIndex(): Int? {
         if (songs.isEmpty()) return null
-        val recentSet = recentHistory.toSet()
-        val candidates = songs.withIndex().filter { it.value.id !in recentSet }
-        val available = if (candidates.isEmpty()) {
-            recentHistory.clear()
-            songs.withIndex().toList()
-        } else {
-            candidates
-        }
+        val available = songs.indices.toList()
         if (available.isEmpty()) return null
 
         val chosen = if (normalCount < 2) {
@@ -177,16 +222,16 @@ private fun MusicScreen() {
             available.random(Random)
         } else {
             normalCount = 0
-            available.maxByOrNull { it.value.playCount } ?: available.random(Random)
+            available.maxByOrNull { songs[it].playCount } ?: available.random(Random)
         }
-        registerRecent(chosen.value.id)
-        return chosen.index
+        return chosen
     }
 
     suspend fun finalizePlayback(isUserSkip: Boolean) {
         val index = currentIndex ?: return
         val song = songs.getOrNull(index) ?: return
-        val elapsed = runCatching { mediaPlayer.currentPosition.toLong() }.getOrDefault(0L)
+        val mp = mediaPlayer ?: return
+        val elapsed = runCatching { mp.currentPosition.toLong() }.getOrDefault(0L)
         val quickSkip = isUserSkip && elapsed < 30_000L
         val delta = if (quickSkip) -2 else 1
         val updatedCount = (song.playCount + delta).coerceAtLeast(0)
@@ -198,30 +243,36 @@ private fun MusicScreen() {
         }
     }
 
-    suspend fun playSong(index: Int, finalizeBefore: Boolean = true) {
+    suspend fun playSong(index: Int, addToStack: Boolean = true) {
         val song = songs.getOrNull(index) ?: return
+        val mp = mediaPlayer ?: return
         try {
-            if (finalizeBefore && hasLoadedTrack) {
+            if (hasLoadedTrack) {
                 finalizePlayback(isUserSkip = true)
             }
-            withContext(Dispatchers.IO) {
-                mediaPlayer.reset()
-                mediaPlayer.setDataSource(context, song.contentUri)
-                mediaPlayer.prepare()
+            
+            if (addToStack && currentIndex != null && currentIndex != index) {
+                playbackStack.add(currentIndex!!)
             }
-            mediaPlayer.start()
+
+            withContext(Dispatchers.IO) {
+                mp.reset()
+                mp.setDataSource(context, song.contentUri)
+                mp.prepare()
+            }
+            mp.start()
+            musicService?.startForegroundService(song.title, song.artist.ifBlank { "Unknown Artist" })
             currentIndex = index
             isPlaying = true
             hasLoadedTrack = true
             showNowPlaying = true
-            registerRecent(song.id)
-            mediaPlayer.setOnCompletionListener {
+            
+            mp.setOnCompletionListener {
                 scope.launch {
                     finalizePlayback(isUserSkip = false)
-                    hasLoadedTrack = false
                     val nextIndex = pickNextIndex()
                     if (nextIndex != null) {
-                        playSong(nextIndex, finalizeBefore = false)
+                        playSong(nextIndex, addToStack = true)
                     } else {
                         isPlaying = false
                         hasLoadedTrack = false
@@ -237,15 +288,16 @@ private fun MusicScreen() {
     }
 
     fun togglePlayPause() {
+        val mp = mediaPlayer ?: return
         if (isPlaying && hasLoadedTrack) {
-            mediaPlayer.pause()
+            mp.pause()
             isPlaying = false
         } else {
             val target = currentIndex ?: pickNextIndex() ?: 0
             if (songs.isNotEmpty()) {
                 try {
                     if (hasLoadedTrack && currentIndex != null) {
-                        mediaPlayer.start()
+                        mp.start()
                         isPlaying = true
                     } else {
                         scope.launch { playSong(target) }
@@ -259,60 +311,44 @@ private fun MusicScreen() {
 
     fun playNext() {
         if (songs.isEmpty()) return
-        scope.launch {
-            val nextIndex = pickNextIndex() ?: ((currentIndex ?: -1) + 1).mod(songs.size)
-            playSong(nextIndex)
-        }
+        val nextIndex = pickNextIndex() ?: ((currentIndex ?: -1) + 1).mod(songs.size)
+        scope.launch { playSong(nextIndex, addToStack = true) }
     }
 
     fun playPrevious() {
         if (songs.isEmpty()) return
-        scope.launch {
-            val previousId = recentHistory.reversed().drop(1).firstOrNull()
-            val targetIndex = previousId?.let { id -> songs.indexOfFirst { it.id == id } }
-            val resolvedIndex = if (targetIndex != null && targetIndex >= 0) {
-                targetIndex
-            } else {
-                val candidate = (currentIndex ?: 0) - 1
-                if (candidate >= 0) candidate else songs.lastIndex
-            }
-            playSong(resolvedIndex)
-        }
-    }
-
-    suspend fun playSong(index: Int) {
-        val song = songs.getOrNull(index) ?: return
-        try {
-            withContext(Dispatchers.IO) {
-                mediaPlayer.reset()
-                mediaPlayer.setDataSource(context, song.contentUri)
-                mediaPlayer.prepare()
-            }
-            mediaPlayer.start()
-            currentIndex = index
-            isPlaying = true
-            hasLoadedTrack = true
-            mediaPlayer.setOnCompletionListener {
-                if (songs.isEmpty()) {
-                    isPlaying = false
-                    currentIndex = null
-                    hasLoadedTrack = false
-                    return@setOnCompletionListener
-                }
-                val nextIndex = if (index + 1 < songs.size) index + 1 else 0
-                scope.launch { playSong(nextIndex) }
-            }
-        } catch (e: Exception) {
-            errorMessage = "Playback failed"
-            isPlaying = false
-            hasLoadedTrack = false
+        if (playbackStack.isNotEmpty()) {
+            val prevIndex = playbackStack.removeAt(playbackStack.size - 1)
+            scope.launch { playSong(prevIndex, addToStack = false) }
+        } else {
+            val targetIndex = ((currentIndex ?: 0) - 1).mod(songs.size)
+            scope.launch { playSong(targetIndex, addToStack = false) }
         }
     }
 
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
-                title = { Text(text = "Offline Player") },
+                title = { 
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OMPLogo()
+                        Spacer(Modifier.width(8.dp))
+                    }
+                },
+                navigationIcon = {
+                    val act = context as? androidx.activity.ComponentActivity
+                    IconButton(onClick = { 
+                        if (showNowPlaying) showNowPlaying = false 
+                        else act?.finish()
+                    }) {
+                        Icon(imageVector = Icons.Rounded.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    TextButton(onClick = { showNowPlaying = false }) {
+                        Text("Songs List", color = MaterialTheme.colorScheme.primary)
+                    }
+                },
                 scrollBehavior = rememberTopAppBarState().let { state ->
                     androidx.compose.material3.TopAppBarDefaults.pinnedScrollBehavior(state)
                 }
@@ -320,7 +356,7 @@ private fun MusicScreen() {
         },
         bottomBar = {
             val currentSong = currentIndex?.let { idx -> songs.getOrNull(idx) }
-            if (currentSong != null) {
+            if (currentSong != null && !showNowPlaying) {
                 PlayerBar(
                     song = currentSong,
                     isPlaying = isPlaying,
@@ -379,6 +415,9 @@ private fun MusicScreen() {
                     NowPlayingOverlay(
                         song = song,
                         isPlaying = isPlaying,
+                        currentPosition = currentPosition,
+                        duration = duration,
+                        onSeek = { musicService?.mediaPlayer?.seekTo(it.toInt()) },
                         onClose = { showNowPlaying = false },
                         onPlayPause = ::togglePlayPause,
                         onNext = ::playNext,
@@ -498,6 +537,9 @@ private fun PlayerBar(
 private fun NowPlayingOverlay(
     song: Song,
     isPlaying: Boolean,
+    currentPosition: Float,
+    duration: Float,
+    onSeek: (Float) -> Unit,
     onClose: () -> Unit,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
@@ -546,6 +588,9 @@ private fun NowPlayingOverlay(
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(text = "Back to list", color = Color.White, style = MaterialTheme.typography.bodyMedium)
                 }
+                
+                OMPLogo()
+                
                 IconButton(onClick = onClose) {
                     Icon(imageVector = Icons.Rounded.Close, contentDescription = "Close", tint = Color.White)
                 }
@@ -610,6 +655,26 @@ private fun NowPlayingOverlay(
                         color = Color(0xCCFFFFFF),
                         style = MaterialTheme.typography.titleMedium
                     )
+                }
+            }
+
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Slider(
+                    value = currentPosition,
+                    onValueChange = onSeek,
+                    valueRange = 0f..duration.coerceAtLeast(1f),
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color.White,
+                        activeTrackColor = Color(0xFF00B8FF),
+                        inactiveTrackColor = Color(0x33FFFFFF)
+                    )
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(text = formatDuration(currentPosition.toLong()), color = Color(0xAAFFFFFF), style = MaterialTheme.typography.bodySmall)
+                    Text(text = formatDuration(duration.toLong()), color = Color(0xAAFFFFFF), style = MaterialTheme.typography.bodySmall)
                 }
             }
 
