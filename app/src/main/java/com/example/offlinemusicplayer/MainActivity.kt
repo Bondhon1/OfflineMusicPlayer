@@ -153,20 +153,152 @@ private fun MusicScreen() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showNowPlaying by remember { mutableStateOf(false) }
     var normalCount by remember { mutableStateOf(0) }
-    
+
     var currentPosition by remember { mutableStateOf(0f) }
     var duration by remember { mutableStateOf(0f) }
     val playbackStack = remember { mutableStateListOf<Int>() }
 
     var musicService by remember { mutableStateOf<MusicService?>(null) }
+
+    fun pickNextIndex(): Int? {
+        if (songs.isEmpty()) return null
+        val available = songs.indices.toList()
+        if (available.isEmpty()) return null
+
+        val chosen = if (normalCount < 2) {
+            normalCount += 1
+            available.random(Random)
+        } else {
+            normalCount = 0
+            available.maxByOrNull { songs[it].playCount } ?: available.random(Random)
+        }
+        return chosen
+    }
+
+    suspend fun finalizePlayback(isUserSkip: Boolean, forcedIndex: Int? = null) {
+        val index = forcedIndex ?: currentIndex ?: return
+        val song = songs.getOrNull(index) ?: return
+        val mp = musicService?.mediaPlayer ?: return
+        val elapsed = runCatching { mp.currentPosition.toLong() }.getOrDefault(0L)
+        val quickSkip = isUserSkip && elapsed < 30_000L
+        val delta = if (quickSkip) -2 else 1
+        val updatedCount = (song.playCount + delta).coerceAtLeast(0)
+        val updatedSong = song.copy(playCount = updatedCount, lastPlayedAt = System.currentTimeMillis())
+        songs = songs.toMutableList().also { it[index] = updatedSong }
+        repository.updatePlayStats(song.id, updatedCount, updatedSong.lastPlayedAt)
+        if (delta > 0) {
+            repository.insertHistory(song.id, System.currentTimeMillis())
+        }
+    }
+
+    suspend fun playSong(index: Int, addToStack: Boolean = true) {
+        val song = songs.getOrNull(index) ?: return
+        val mp = musicService?.mediaPlayer ?: return
+        val oldIndex = currentIndex
+
+        try {
+            if (hasLoadedTrack) {
+                finalizePlayback(isUserSkip = true, forcedIndex = oldIndex)
+            }
+
+            if (addToStack && oldIndex != null && oldIndex != index) {
+                playbackStack.add(oldIndex)
+            }
+
+            // Update state early so UI shows the new song while it's preparing
+            currentIndex = index
+            showNowPlaying = true
+            isPlaying = true // Assume it will play
+
+            withContext(Dispatchers.IO) {
+                mp.reset()
+                mp.setDataSource(context, song.contentUri)
+                mp.prepare()
+            }
+            mp.start()
+            musicService?.startForegroundService(song.title, song.artist.ifBlank { "Unknown Artist" }, true)
+            hasLoadedTrack = true
+
+            mp.setOnCompletionListener {
+                scope.launch {
+                    finalizePlayback(isUserSkip = false)
+                    val nextIndex = pickNextIndex()
+                    if (nextIndex != null) {
+                        playSong(nextIndex, addToStack = true)
+                    } else {
+                        isPlaying = false
+                        hasLoadedTrack = false
+                        currentIndex = null
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            errorMessage = "Playback failed"
+            isPlaying = false
+            hasLoadedTrack = false
+        }
+    }
+
+    fun togglePlayPause() {
+        val mp = musicService?.mediaPlayer ?: return
+        val currentSong = currentIndex?.let { songs.getOrNull(it) }
+        if (isPlaying && hasLoadedTrack) {
+            mp.pause()
+            isPlaying = false
+            currentSong?.let { musicService?.startForegroundService(it.title, it.artist.ifBlank { "Unknown Artist" }, false) }
+        } else {
+            val target = currentIndex ?: pickNextIndex() ?: 0
+            if (songs.isNotEmpty()) {
+                try {
+                    if (hasLoadedTrack && currentIndex != null) {
+                        mp.start()
+                        isPlaying = true
+                        currentSong?.let { musicService?.startForegroundService(it.title, it.artist.ifBlank { "Unknown Artist" }, true) }
+                    } else {
+                        scope.launch { playSong(target) }
+                    }
+                } catch (_: IllegalStateException) {
+                    scope.launch { playSong(target) }
+                }
+            }
+        }
+    }
+
+    fun playNext() {
+        if (songs.isEmpty()) return
+        val nextIndex = pickNextIndex() ?: ((currentIndex ?: -1) + 1).mod(songs.size)
+        scope.launch { playSong(nextIndex, addToStack = true) }
+    }
+
+    fun playPrevious() {
+        if (songs.isEmpty()) return
+        if (playbackStack.isNotEmpty()) {
+            val prevIndex = playbackStack.removeAt(playbackStack.size - 1)
+            scope.launch { playSong(prevIndex, addToStack = false) }
+        } else {
+            val targetIndex = ((currentIndex ?: 0) - 1).mod(songs.size)
+            scope.launch { playSong(targetIndex, addToStack = false) }
+        }
+    }
+
     val connection = remember {
         object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-                musicService = (service as MusicService.MusicBinder).getService()
+                val binder = service as MusicService.MusicBinder
+                val s = binder.getService()
+                musicService = s
+
+                // Connect notification callbacks
+                s.onPlayPause = { togglePlayPause() }
+                s.onNext = { playNext() }
+                s.onPrevious = { playPrevious() }
             }
-            override fun onServiceDisconnected(name: ComponentName?) { musicService = null }
+            override fun onServiceDisconnected(name: ComponentName?) {
+                musicService = null
+            }
         }
     }
+
     DisposableEffect(Unit) {
         val intent = Intent(context, MusicService::class.java)
         context.startService(intent)
@@ -180,7 +312,7 @@ private fun MusicScreen() {
     ) { result ->
         hasPermission = result.values.all { it }
     }
-    
+
     LaunchedEffect(isPlaying, hasLoadedTrack, mediaPlayer) {
         if (isPlaying && hasLoadedTrack && mediaPlayer != null) {
             while (true) {
@@ -212,147 +344,35 @@ private fun MusicScreen() {
         }
     }
 
-    fun pickNextIndex(): Int? {
-        if (songs.isEmpty()) return null
-        val available = songs.indices.toList()
-        if (available.isEmpty()) return null
-
-        val chosen = if (normalCount < 2) {
-            normalCount += 1
-            available.random(Random)
-        } else {
-            normalCount = 0
-            available.maxByOrNull { songs[it].playCount } ?: available.random(Random)
-        }
-        return chosen
-    }
-
-    suspend fun finalizePlayback(isUserSkip: Boolean) {
-        val index = currentIndex ?: return
-        val song = songs.getOrNull(index) ?: return
-        val mp = mediaPlayer ?: return
-        val elapsed = runCatching { mp.currentPosition.toLong() }.getOrDefault(0L)
-        val quickSkip = isUserSkip && elapsed < 30_000L
-        val delta = if (quickSkip) -2 else 1
-        val updatedCount = (song.playCount + delta).coerceAtLeast(0)
-        val updatedSong = song.copy(playCount = updatedCount, lastPlayedAt = System.currentTimeMillis())
-        songs = songs.toMutableList().also { it[index] = updatedSong }
-        repository.updatePlayStats(song.id, updatedCount, updatedSong.lastPlayedAt)
-        if (delta > 0) {
-            repository.insertHistory(song.id, System.currentTimeMillis())
-        }
-    }
-
-    suspend fun playSong(index: Int, addToStack: Boolean = true) {
-        val song = songs.getOrNull(index) ?: return
-        val mp = mediaPlayer ?: return
-        try {
-            if (hasLoadedTrack) {
-                finalizePlayback(isUserSkip = true)
-            }
-            
-            if (addToStack && currentIndex != null && currentIndex != index) {
-                playbackStack.add(currentIndex!!)
-            }
-
-            withContext(Dispatchers.IO) {
-                mp.reset()
-                mp.setDataSource(context, song.contentUri)
-                mp.prepare()
-            }
-            mp.start()
-            musicService?.startForegroundService(song.title, song.artist.ifBlank { "Unknown Artist" })
-            currentIndex = index
-            isPlaying = true
-            hasLoadedTrack = true
-            showNowPlaying = true
-            
-            mp.setOnCompletionListener {
-                scope.launch {
-                    finalizePlayback(isUserSkip = false)
-                    val nextIndex = pickNextIndex()
-                    if (nextIndex != null) {
-                        playSong(nextIndex, addToStack = true)
-                    } else {
-                        isPlaying = false
-                        hasLoadedTrack = false
-                        currentIndex = null
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            errorMessage = "Playback failed"
-            isPlaying = false
-            hasLoadedTrack = false
-        }
-    }
-
-    fun togglePlayPause() {
-        val mp = mediaPlayer ?: return
-        if (isPlaying && hasLoadedTrack) {
-            mp.pause()
-            isPlaying = false
-        } else {
-            val target = currentIndex ?: pickNextIndex() ?: 0
-            if (songs.isNotEmpty()) {
-                try {
-                    if (hasLoadedTrack && currentIndex != null) {
-                        mp.start()
-                        isPlaying = true
-                    } else {
-                        scope.launch { playSong(target) }
-                    }
-                } catch (_: IllegalStateException) {
-                    scope.launch { playSong(target) }
-                }
-            }
-        }
-    }
-
-    fun playNext() {
-        if (songs.isEmpty()) return
-        val nextIndex = pickNextIndex() ?: ((currentIndex ?: -1) + 1).mod(songs.size)
-        scope.launch { playSong(nextIndex, addToStack = true) }
-    }
-
-    fun playPrevious() {
-        if (songs.isEmpty()) return
-        if (playbackStack.isNotEmpty()) {
-            val prevIndex = playbackStack.removeAt(playbackStack.size - 1)
-            scope.launch { playSong(prevIndex, addToStack = false) }
-        } else {
-            val targetIndex = ((currentIndex ?: 0) - 1).mod(songs.size)
-            scope.launch { playSong(targetIndex, addToStack = false) }
-        }
-    }
-
     Scaffold(
         topBar = {
-            CenterAlignedTopAppBar(
-                title = { 
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        OMPLogo()
-                        Spacer(Modifier.width(8.dp))
+            if (!showNowPlaying) {
+                CenterAlignedTopAppBar(
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OMPLogo()
+                            Spacer(Modifier.width(8.dp))
+                        }
+                    },
+                    navigationIcon = {
+                        val act = context as? androidx.activity.ComponentActivity
+                        IconButton(onClick = {
+                            if (showNowPlaying) showNowPlaying = false
+                            else act?.finish()
+                        }) {
+                            Icon(imageVector = Icons.Rounded.ArrowBack, contentDescription = "Back")
+                        }
+                    },
+                    actions = {
+                        TextButton(onClick = { showNowPlaying = false }) {
+                            Text("Songs List", color = MaterialTheme.colorScheme.primary)
+                        }
+                    },
+                    scrollBehavior = rememberTopAppBarState().let { state ->
+                        androidx.compose.material3.TopAppBarDefaults.pinnedScrollBehavior(state)
                     }
-                },
-                navigationIcon = {
-                    val act = context as? androidx.activity.ComponentActivity
-                    IconButton(onClick = { 
-                        if (showNowPlaying) showNowPlaying = false 
-                        else act?.finish()
-                    }) {
-                        Icon(imageVector = Icons.Rounded.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                actions = {
-                    TextButton(onClick = { showNowPlaying = false }) {
-                        Text("Songs List", color = MaterialTheme.colorScheme.primary)
-                    }
-                },
-                scrollBehavior = rememberTopAppBarState().let { state ->
-                    androidx.compose.material3.TopAppBarDefaults.pinnedScrollBehavior(state)
-                }
-            )
+                )
+            }
         },
         bottomBar = {
             val currentSong = currentIndex?.let { idx -> songs.getOrNull(idx) }
@@ -588,9 +608,7 @@ private fun NowPlayingOverlay(
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(text = "Back to list", color = Color.White, style = MaterialTheme.typography.bodyMedium)
                 }
-                
-                OMPLogo()
-                
+
                 IconButton(onClick = onClose) {
                     Icon(imageVector = Icons.Rounded.Close, contentDescription = "Close", tint = Color.White)
                 }
