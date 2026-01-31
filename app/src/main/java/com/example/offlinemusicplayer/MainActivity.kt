@@ -99,7 +99,7 @@ import kotlin.random.Random
 @Composable
 fun OMPLogo(modifier: Modifier = Modifier) {
     Image(
-        painter = painterResource(id = R.drawable.logo),
+        painter = painterResource(id = R.drawable.logo_transparent),
         contentDescription = "OMP logo",
         modifier = modifier
             .size(38.dp)
