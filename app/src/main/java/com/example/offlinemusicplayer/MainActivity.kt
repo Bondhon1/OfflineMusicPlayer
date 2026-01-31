@@ -23,6 +23,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -82,6 +83,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.offlinemusicplayer.data.MusicRepository
@@ -96,25 +98,13 @@ import kotlin.random.Random
 
 @Composable
 fun OMPLogo(modifier: Modifier = Modifier) {
-    Box(
+    Image(
+        painter = painterResource(id = R.drawable.logo),
+        contentDescription = "OMP logo",
         modifier = modifier
             .size(38.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(
-                Brush.linearGradient(
-                    colors = listOf(Color(0xFF4285F4), Color(0xFF34A853))
-                )
-            ),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = "OMP",
-            color = Color.White,
-            style = MaterialTheme.typography.labelLarge.copy(
-                fontWeight = FontWeight.ExtraBold
-            )
-        )
-    }
+    )
 }
 
 class MainActivity : ComponentActivity() {
@@ -158,7 +148,7 @@ private fun MusicScreen() {
     var duration by remember { mutableStateOf(0f) }
     val playbackStack = remember { mutableStateListOf<Int>() }
     val recentQueue = remember { ArrayDeque<Long>() }
-    val recentLimit = 4
+    val recentLimit = 15
     var isChangingTrack by remember { mutableStateOf(false) }
 
     var musicService by remember { mutableStateOf<MusicService?>(null) }
