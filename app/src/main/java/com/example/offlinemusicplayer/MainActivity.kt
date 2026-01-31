@@ -157,22 +157,32 @@ private fun MusicScreen() {
     var currentPosition by remember { mutableStateOf(0f) }
     var duration by remember { mutableStateOf(0f) }
     val playbackStack = remember { mutableStateListOf<Int>() }
+    val recentQueue = remember { ArrayDeque<Long>() }
+    val recentLimit = 4
+    var isChangingTrack by remember { mutableStateOf(false) }
 
     var musicService by remember { mutableStateOf<MusicService?>(null) }
 
     fun pickNextIndex(): Int? {
         if (songs.isEmpty()) return null
-        val available = songs.indices.toList()
-        if (available.isEmpty()) return null
+        val blockedIds = recentQueue.toSet()
+        val candidatePool = songs.indices.filter { songs[it].id !in blockedIds }
+        val pool = if (candidatePool.isNotEmpty()) candidatePool else songs.indices.toList()
 
         val chosen = if (normalCount < 2) {
             normalCount += 1
-            available.random(Random)
+            pool.random(Random)
         } else {
             normalCount = 0
-            available.maxByOrNull { songs[it].playCount } ?: available.random(Random)
+            pool.maxByOrNull { songs[it].playCount } ?: pool.random(Random)
         }
         return chosen
+    }
+
+    fun trackRecent(songId: Long) {
+        recentQueue.remove(songId)
+        recentQueue.addLast(songId)
+        while (recentQueue.size > recentLimit) recentQueue.removeFirst()
     }
 
     suspend fun finalizePlayback(isUserSkip: Boolean, forcedIndex: Int? = null) {
@@ -191,13 +201,22 @@ private fun MusicScreen() {
         }
     }
 
-    suspend fun playSong(index: Int, addToStack: Boolean = true) {
-        val song = songs.getOrNull(index) ?: return
-        val mp = musicService?.mediaPlayer ?: return
+    suspend fun playSong(index: Int, addToStack: Boolean = true, skipFinalizeCurrent: Boolean = false) {
+        if (isChangingTrack) return
+        isChangingTrack = true
+
+        val song = songs.getOrNull(index) ?: run {
+            isChangingTrack = false
+            return
+        }
+        val mp = musicService?.mediaPlayer ?: run {
+            isChangingTrack = false
+            return
+        }
         val oldIndex = currentIndex
 
         try {
-            if (hasLoadedTrack) {
+            if (hasLoadedTrack && !skipFinalizeCurrent) {
                 finalizePlayback(isUserSkip = true, forcedIndex = oldIndex)
             }
 
@@ -211,12 +230,14 @@ private fun MusicScreen() {
             isPlaying = true // Assume it will play
 
             withContext(Dispatchers.IO) {
+                mp.setOnCompletionListener(null)
                 mp.reset()
                 mp.setDataSource(context, song.contentUri)
                 mp.prepare()
             }
             mp.start()
             musicService?.startForegroundService(song.title, song.artist.ifBlank { "Unknown Artist" }, true)
+            trackRecent(song.id)
             hasLoadedTrack = true
 
             mp.setOnCompletionListener {
@@ -224,7 +245,7 @@ private fun MusicScreen() {
                     finalizePlayback(isUserSkip = false)
                     val nextIndex = pickNextIndex()
                     if (nextIndex != null) {
-                        playSong(nextIndex, addToStack = true)
+                        playSong(nextIndex, addToStack = true, skipFinalizeCurrent = true)
                     } else {
                         isPlaying = false
                         hasLoadedTrack = false
@@ -236,10 +257,13 @@ private fun MusicScreen() {
             errorMessage = "Playback failed"
             isPlaying = false
             hasLoadedTrack = false
+        } finally {
+            isChangingTrack = false
         }
     }
 
     fun togglePlayPause() {
+        if (isChangingTrack) return
         val mp = musicService?.mediaPlayer ?: return
         val currentSong = currentIndex?.let { songs.getOrNull(it) }
         if (isPlaying && hasLoadedTrack) {
@@ -265,12 +289,14 @@ private fun MusicScreen() {
     }
 
     fun playNext() {
+        if (isChangingTrack) return
         if (songs.isEmpty()) return
         val nextIndex = pickNextIndex() ?: ((currentIndex ?: -1) + 1).mod(songs.size)
         scope.launch { playSong(nextIndex, addToStack = true) }
     }
 
     fun playPrevious() {
+        if (isChangingTrack) return
         if (songs.isEmpty()) return
         if (playbackStack.isNotEmpty()) {
             val prevIndex = playbackStack.removeAt(playbackStack.size - 1)

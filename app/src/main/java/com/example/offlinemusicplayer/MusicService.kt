@@ -17,6 +17,7 @@ import androidx.media.app.NotificationCompat as MediaNotificationCompat
 class MusicService : Service() {
     val mediaPlayer = MediaPlayer()
     private val binder = MusicBinder()
+    private var isForegroundStarted = false
 
     var onPlayPause: (() -> Unit)? = null
     var onNext: (() -> Unit)? = null
@@ -50,10 +51,17 @@ class MusicService : Service() {
 
     fun startForegroundService(title: String, artist: String, isPlaying: Boolean) {
         val notification = createNotification(title, artist, isPlaying)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        val manager = getSystemService(NotificationManager::class.java)
+
+        if (!isForegroundStarted) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            } else {
+                startForeground(1, notification)
+            }
+            isForegroundStarted = true
         } else {
-            startForeground(1, notification)
+            manager.notify(1, notification)
         }
     }
 
