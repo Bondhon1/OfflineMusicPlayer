@@ -98,13 +98,19 @@ import kotlin.random.Random
 
 @Composable
 fun OMPLogo(modifier: Modifier = Modifier) {
-    Image(
-        painter = painterResource(id = R.drawable.logo_transparent),
-        contentDescription = "OMP logo",
+    Box(
         modifier = modifier
             .size(38.dp)
             .clip(RoundedCornerShape(8.dp))
-    )
+            .background(Color(0xFF0A1222)),
+        contentAlignment = Alignment.Center
+    ) {
+        Image(
+            painter = painterResource(id = R.drawable.logo_transparent),
+            contentDescription = "OMP logo",
+            modifier = Modifier.size(30.dp)
+        )
+    }
 }
 
 class MainActivity : ComponentActivity() {
